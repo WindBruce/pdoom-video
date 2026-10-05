@@ -20,6 +20,12 @@ export interface SceneCtx {
   /** Entry window (song seconds). */
   start: number;
   end: number;
+  /**
+   * For a `moving` entry of Scene.tileMasked, before drawing into it in a sub-frame: its texel at uv is read
+   * on screen at uv * map.xy + map.zw this sub-frame (a zoom or pan), so its tile mask is mapped there; null
+   * draws it whole. A no-op outside masked sub-frames.
+   */
+  mapTileMask(rt: THREE.WebGLRenderTarget, map: THREE.Vector4 | null): void;
 }
 
 export interface Frame {
@@ -64,6 +70,14 @@ export abstract class Scene {
   prerollMax = 6;
   /** If true, this scene composites `f.under` itself during its incoming transition. */
   handlesTransition = false;
+  /**
+   * The scene's own render targets (with a depth buffer) that adaptive per-tile refinement may mask like
+   * `out`: once a tile has converged, later sub-frames skip shading it there too. Only for a target whose
+   * texels are read back at their own screen position, or at most a few px off it (`margin: 1` widens the
+   * mask by a tile, 32 logical px), or, if `moving`, at a place the scene gives with ctx.mapTileMask before
+   * each sub-frame's draws. Targets read elsewhere (warped, blurred far) must not be listed.
+   */
+  tileMasked: { rt: THREE.WebGLRenderTarget; margin: 0 | 1; moving?: boolean }[] = [];
 
   constructor(protected ctx: SceneCtx) {}
 

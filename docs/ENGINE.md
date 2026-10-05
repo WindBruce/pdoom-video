@@ -83,11 +83,13 @@ Rules:
 
 ## Motion blur and sampling
 
-The export renders every frame as the average of many sub-frames spread over the shutter (`--shutter 0.2`: a fifth of the frame time, centred on the frame's time), before post-processing. `--samples N` takes N evenly spaced sub-frames; `--samples auto` chooses the count per frame (`Engine.render`, `AdaptiveSampling`):
+The export renders every frame as the average of many sub-frames spread over the shutter (`--shutter 0.2`: a fifth of the frame time, centred on the frame's time), before post-processing. `--samples N` takes N evenly spaced sub-frames; `--samples auto` chooses the count per 32×32-logical-px tile (`Engine.render`, `AdaptiveSampling`):
 
 - The count steps through 4, 12, 36, 108, 324. Each step adds a sub-frame either side of every existing one, so each set is evenly spread and centred on the frame's time.
-- After each step the engine compares the new sub-frames' average with the old ones' (displayed values, worst 2×2-logical-px block). Stepped copies of a moving edge differ between the two sets; a converged streak or a still image does not. Stepping shrinks as 1/count, so the frame's remaining error is about half the change the last step made; it stops when that is below `--tol` (default 3 levels of 255).
+- After each step the engine compares the new sub-frames' average with the old ones' (displayed values, worst 2×2-logical-px block). Stepped copies of a moving edge differ between the two sets; a converged streak or a still image does not. Stepping shrinks as 1/count, so the remaining error is about half the change the last step made; a tile stops when that is below `--tol` (default 3 levels of 255) in it and its 8 neighbours. A tile that has stopped is final: it is the average of its first n sub-frames, the image the per-frame sampler would give had it stopped at n.
+- Later sub-frames skip the tiles that have stopped: the engine writes the tiles still refining into the depth buffer of its targets, and while it renders a sub-frame every draw into them is depth-tested against that mask, whatever the material says, so the GPU rejects the stopped tiles before shading them (early-Z; a stencil test does not reject early on Apple GPUs). The final average weighs each tile by its own count.
 - In practice a still frame stops at 12, ordinary camera motion at 36, and whips, slams and fast zooms at 108 or 324. At 1:1 in 4K, 108 can't be told from 324, while 36 still shows faint striations on the fastest edges.
+- `refine: 'frame'` (`--refine frame`) decides for the whole frame at once, as before tiles: every tile then takes the count its worst tile needs.
 
 What this asks of scenes:
 
@@ -97,6 +99,8 @@ What this asks of scenes:
 - A spark emitter whose rate varies over time passes the rate as a function of the birth time, with its maximum (`sparkParticles(..., { rate: (tb) => ..., rateMax })`). A rate read at the current `t` re-times every particle from one sub-frame to the next.
 - Shaders that supersample internally (4 rotated-grid taps) take `ssTap: SS_TAP` and `${SS_TAP_GLSL}` and loop `for (int k = ssK0(); k < ssK1(); k++) ... rgss(k)`, weighting by `ssWeight()`. The engine then hands each sub-frame one tap, cycling them (every set is a multiple of 4), which averages to the same image for a quarter of the cost. In the preview and single-sample stills they take all four.
 - Post parameters (shake, flash, zoom, fades, the HUD mode) are read at one point of the shutter, 1/8 of it after the frame's time (where the video was tuned, and a point every sample set includes); the HUD, grain and dither are drawn once per frame.
+- Masked tiles keep what the last sub-frame drew there. That is safe for `out` and the engine's own targets. A scene's own target keeps being drawn in full (and costs full price) unless the scene lists it in `tileMasked`: only a target with a depth buffer whose texels are read back at their own screen position or within a few px of it (`margin: 1` widens the mask by a tile), like shoggoth's half-res G-buffer, or, with `moving: true`, one read through a zoom or pan that the scene gives before each sub-frame's draws with `ctx.mapTileMask(rt, map)`, like the room at the bottom of loom's dive (`null` while it is read through the spiral). A target read through a warp or a wide blur must not be listed.
+- A draw into a masked target whose material asks for its own depth test (3D with a depth buffer) can't use the mask: the engine draws that sub-frame again unmasked and keeps drawing that scene unmasked.
 
 ## Shared motifs (`app/src/scenes/_motifs.ts`)
 

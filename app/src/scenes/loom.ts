@@ -62,7 +62,10 @@ export default class Loom extends Scene {
   pdoom!: PDoom;
   tree!: LoomTree;
   room!: IlyaRoom;
-  roomRT = makeRT(W, H, { depthBuffer: false });
+  roomRT = makeRT(W, H);
+  // (untwisted, the room is read through a zoom about the centre: its tile mask follows it, see render)
+  override tileMasked = [{ rt: this.roomRT, margin: 1 as const, moving: true }];
+  private roomMap = new THREE.Vector4();
   T!: { start: number; end: number; s2: number; s3: number; twist: number; untwist: number; beats: number[]; b1: number; b2: number; b3: number };
   context = '…I’m upping my P(doom)'; // the lyric it continues (display punctuation, like the ellipsis)
 
@@ -412,16 +415,23 @@ export default class Loom extends Scene {
     const zoom = lerp(stepped, TERM_LEVEL, dive);
     // the bottom frame: FIG. 14's room, live
     const termVisible = zoom > TERM_LEVEL - 3.2;
-    if (termVisible) this.room.render(renderer, this.roomRT, t);
+    const s = lerp(16, 2.6, open);
+    const twist = prog(t, T.twist - 0.05, T.twist + 0.05, ease.inOutCubic) * (1 - prog(t, T.untwist - 0.04, T.untwist + 0.14, ease.inOutCubic));
+    if (termVisible) {
+      // untwisted, the bottom frame's uv is (screen uv - 0.5) * s^(TERM_LEVEL - zoom) + 0.5 (FRAG_DROSTE)
+      const k = Math.pow(s, zoom - TERM_LEVEL);
+      this.ctx.mapTileMask(this.roomRT, twist === 0 ? this.roomMap.set(k, k, 0.5 - 0.5 * k, 0.5 - 0.5 * k) : null);
+      this.room.render(renderer, this.roomRT, t);
+    }
     const u = this.droste.u;
     u.src!.value = this.plateTex;
     u.atlas!.value = this.atlasTex;
     u.term!.value = this.roomRT.texture;
     u.termLevel!.value = termVisible ? TERM_LEVEL : 99;
     (u.labelRect!.value as THREE.Vector4).set(TAG.x / W, 1 - (TAG.y + TAG.h) / H, (TAG.x + TAG.w) / W, 1 - TAG.y / H);
-    u.s!.value = lerp(16, 2.6, open);
+    u.s!.value = s;
     u.zoom!.value = zoom;
-    u.twist!.value = prog(t, T.twist - 0.05, T.twist + 0.05, ease.inOutCubic) * (1 - prog(t, T.untwist - 0.04, T.untwist + 0.14, ease.inOutCubic));
+    u.twist!.value = twist;
     u.spin!.value = 0;
     this.droste.render(renderer, out);
     // the line itself stays put and crisp over the dive (the nested copies echo it at every scale)

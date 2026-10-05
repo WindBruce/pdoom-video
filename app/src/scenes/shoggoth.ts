@@ -108,7 +108,9 @@ class MRTPass {
 interface CamState { pos: V3; target: V3; roll: number }
 
 export default class Shoggoth extends Scene {
-  private gbuf = new THREE.WebGLRenderTarget(GW, GH, { count: 2, type: THREE.FloatType, format: THREE.RGBAFormat, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false });
+  // (the depth buffer carries per-tile refinement's mask: the composite reads the G-buffer within a texel of its pixel)
+  private gbuf = new THREE.WebGLRenderTarget(GW, GH, { count: 2, type: THREE.FloatType, format: THREE.RGBAFormat, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: true });
+  override tileMasked = [{ rt: this.gbuf, margin: 1 as const }];
   private shared: Record<string, THREE.IUniform> = {
     camPos: { value: v3(0, 0, 5) }, camR: { value: v3(1, 0, 0) }, camU: { value: v3(0, 1, 0) }, camF: { value: v3(0, 0, -1) },
     tanF: { value: TANF }, aspect: { value: W / H }, squash: { value: 1 }, uT: { value: 0 },

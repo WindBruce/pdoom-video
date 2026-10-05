@@ -30,13 +30,70 @@ async function boot() {
 }
 
 // ------------------------------------------------------------------ export API
+/** The last frame stream() rendered (a range starting right after it needs no warm-up). */
+let lastStreamed = -2;
+const senders = new Map<string, Promise<Sender>>();
+interface Sender { send(fill: (buf: Uint8Array) => Promise<unknown>): Promise<void> }
+
+/**
+ * A WebSocket written from a worker thread: send() fills a pooled frame buffer, transfers it to the worker
+ * (no copy) and returns once the buffer is on its way, waiting first while `inflight` frames are unacknowledged.
+ */
+function sender(url: string, inflight: number): Promise<Sender> {
+  let s = senders.get(url);
+  if (s) return s;
+  s = new Promise<Sender>((resolve, reject) => {
+    const src = `let ws;
+      onmessage = (e) => {
+        const m = e.data;
+        if (m.open) {
+          ws = new WebSocket(m.open); ws.binaryType = 'arraybuffer';
+          ws.onopen = () => postMessage({ open: true });
+          ws.onerror = () => postMessage({ error: 'websocket error' });
+          ws.onclose = () => postMessage({ error: 'websocket closed' });
+          ws.onmessage = (ev) => postMessage({ acked: +ev.data || 0 });
+        } else {
+          ws.send(m.buf); // (copies the frame: the buffer can go straight back)
+          postMessage({ free: m.buf }, [m.buf]);
+        }
+      };`;
+    const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    const free: ArrayBuffer[] = [];
+    let sent = 0, acked = 0, failed = '', pool = 0;
+    let wake: (() => void) | null = null;
+    const notify = () => { const f = wake; wake = null; f?.(); };
+    const wait = () => new Promise<void>((r) => { wake = r; });
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (m.open) resolve({ send });
+      else if (m.error) { failed = m.error; reject(new Error(m.error)); notify(); }
+      else if (m.acked !== undefined) { acked = Math.max(acked, m.acked); notify(); }
+      else if (m.free) { free.push(m.free); notify(); }
+    };
+    async function send(fill: (buf: Uint8Array) => Promise<unknown>) {
+      while (!failed && sent - acked >= inflight) await wait();
+      if (failed) throw new Error(failed);
+      // two buffers: one being filled while the other is with the worker (it comes straight back)
+      if (!free.length && pool < 2) { free.push(new ArrayBuffer(Engine.RGB_BYTES)); pool++; }
+      while (!free.length) await wait();
+      const buf = free.pop()!;
+      await fill(new Uint8Array(buf));
+      w.postMessage({ buf }, [buf]);
+      sent++;
+    }
+    w.postMessage({ open: url });
+  });
+  senders.set(url, s);
+  return s;
+}
+
 function setupExport() {
   document.body.classList.add('export');
   window.__pdoom = {
     engine,
     duration: engine.duration,
     errors: engine.errors,
-    /** Output size in px (1920x1080 times scale); stream() sends frames of width*height*4 bytes. */
+    /** Output size in px (1920x1080 times scale); stream() sends frames of width*height*3 bytes (rgb24). */
     scale: SCALE,
     width: PW,
     height: PH,
@@ -56,37 +113,33 @@ function setupExport() {
       return btoa(s);
     },
     /**
-     * Render [from, to) at fps and stream raw RGBA frames (bottom-up) over a WebSocket.
-     * Returns when all frames were sent, with a histogram of sub-frames per frame. With `inflight`, the
-     * receiver acknowledges each frame it has handed on (a text message with its running count) and at
-     * most `inflight` frames are unacknowledged:
-     * backpressure from the encoder, so a slow encode (4K) cannot pile frames up in the receiver's memory.
+     * Render [from, to) at fps and stream raw rgb24 frames (bottom-up) over a WebSocket, in order.
+     * Returns when all frames were handed to the socket, with a histogram of sub-frames per frame. The
+     * receiver acknowledges each frame it has taken (a text message with its running count) and at most
+     * `inflight` frames are unacknowledged: backpressure from the encoder, so a slow encode (4K) cannot
+     * pile frames up in memory. Pipelined: frame n's readback is collected while n+1 renders, and the
+     * socket is written from a worker thread. Calls with the same `ws` reuse its connection, so a
+     * renderer can be handed several ranges; a range that goes on where the last one ended skips the warm-up.
      */
     async stream(opts: { from: number; to: number; fps: number; ws: string; samples?: number | AdaptiveSampling; shutter?: number; inflight?: number }) {
-      const ws = new WebSocket(opts.ws);
-      ws.binaryType = 'arraybuffer';
-      let acked = 0;
-      ws.onmessage = (e) => { if (typeof e.data === 'string') acked = Math.max(acked, +e.data || 0); };
-      await new Promise<void>((res, rej) => { ws.onopen = () => res(); ws.onerror = (e) => rej(e); });
+      const snd = await sender(opts.ws, opts.inflight ?? 4);
       const dt = 1 / opts.fps;
       const n0 = Math.round(opts.from * opts.fps), n1 = Math.round(opts.to * opts.fps);
-      const buf = new Uint8Array(PW * PH * 4);
-      // warm-up: render one frame before the range so the first frame is sequential for stateful scenes
       const S = opts.samples ?? 1, SH = opts.shutter ?? 0.5;
+      // warm-up: render one frame before the range so the first frame is sequential for stateful scenes
       // (adaptive sampling only runs stateless scenes: one sample is enough for the warm-up)
-      if (n0 > 0) engine.render((n0 - 1) * dt, dt, false, typeof S === 'number' ? S : 1, SH);
+      if (n0 > 0 && lastStreamed !== n0 - 1) engine.render((n0 - 1) * dt, dt, false, typeof S === 'number' ? S : 1, SH);
       const used: Record<number, number> = {}; // sub-frames per frame -> frames
+      let pending = -1;
       for (let n = n0; n < n1; n++) {
         const k = engine.render(n * dt, dt, false, S, SH);
         used[k] = (used[k] ?? 0) + 1;
-        await engine.readPixelsAsync(buf);
-        if (opts.inflight) while (n - n0 - acked >= opts.inflight) await new Promise((r) => setTimeout(r, 2));
-        while (ws.bufferedAmount > 64 * 1024 * 1024) await new Promise((r) => setTimeout(r, 2));
-        ws.send(buf);
-        if (n % 30 === 0) await new Promise((r) => setTimeout(r, 0)); // let the socket flush
+        engine.readStart(n & 1);
+        if (pending >= 0) await snd.send((buf) => engine.readFinish(pending & 1, buf));
+        pending = n;
       }
-      while (ws.bufferedAmount > 0) await new Promise((r) => setTimeout(r, 5));
-      ws.close();
+      if (pending >= 0) await snd.send((buf) => engine.readFinish(pending & 1, buf));
+      lastStreamed = n1 - 1;
       return used;
     },
   };
