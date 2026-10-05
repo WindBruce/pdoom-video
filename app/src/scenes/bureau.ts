@@ -3,14 +3,18 @@
 //   A. Form 7-B (safety evaluation): the lyric is typewritten into the fields; SAFE ENOUGH stamp slams on "reckoned".
 //   B. Annex B (MLP schematic): the pulse sweeps forward on "Forward M-L-P", back on "backward" (typeset mirrored,
 //      right to left), and "repeat" stutters the last beat x3 (the annex is re-rendered at remapped time).
-//   C. Appendix C (the von Neumann architecture, a textbook figure): struck through in orange marker on "obsolete",
-//      then the page tears in two and falls away to black.
+//   C. Appendix C (the von Neumann architecture, a textbook figure): struck through in orange marker on "obsolete".
+//      The hand-off: the next plate's spark comes up its critical path under the page (its light shows through),
+//      bursts through on the beat before the cut and burns the page in two as the camera picks up its chase;
+//      the halves swing open onto that plate, which is rendered here under the page, line and spark in place.
 // Rendering: all ink is drawn on one Canvas2D layer as channel-coded coverage (R = typewriter/pen ink,
 // G = printed ink, B = orange ink), composited onto procedural paper by a shader (fibres, ink grain, stamp texture),
-// then a tear pass cuts the page into pieces.
+// then a burn pass cuts the page along the spark's path and composites the halves over the next plate.
 import * as THREE from 'three';
 import { Scene, type Frame, type PostOverrides } from '../engine/scene';
 import { FSPass, Layer2D, W, H, makeRT } from '../engine/gl';
+import { DEFAULT_POST, type PostParams } from '../engine/post';
+import LeftTurn from './leftturn';
 import { type Line, type Word, norm } from '../engine/lyrics';
 import { F, font, measure, layout, glyphX } from '../engine/type';
 import { strokeText, drawStrokeText, type StrokeText } from '../engine/stroke';
@@ -29,6 +33,14 @@ const ORANGE = (a = 1) => `rgba(0,0,255,${a})`;
 const A = { x: 0, y: 0 };
 const B = { x: 0, y: 1500 };
 const C = { x: 0, y: 3000 };
+/** The appendix sheet's top edge (relative to C), seen only in the hand-off. */
+const SHEET_TOP = -625;
+/**
+ * The hand-off: how much faster than the next plate's drawing the page slides in the chase (it lies nearer
+ * the camera), how far the halves peel up behind the spark while the page still holds (rad), and over what
+ * length (px).
+ */
+const HANDOFF = { slideK: 1.25, wake: 0.5, wakeLen: 700 };
 
 const PAPER_FRAG = /* glsl */ `
 uniform sampler2D inkTex;
@@ -37,6 +49,7 @@ uniform vec2 blurV;                        // motion blur (screen px)
 uniform vec4 st0; uniform vec4 st0b;       // stamp 0: centre.xy, half.xy | angle, strength, seed, -
 uniform vec4 st1; uniform vec4 st1b;
 uniform float zoom;
+uniform float sheetTop;                    // page y of the appendix sheet's top edge (in the hand-off only)
 
 float fibres(vec2 p, float cs) {
   float acc = 0.0;
@@ -136,54 +149,103 @@ void main() {
   // slight vignette on the sheet
   vec2 dc = vUv - 0.5;
   col *= 1.0 - 0.16 * pow(length(dc * vec2(1.0, 0.85)) * 1.5, 2.6);
-  fragColor = vec4(col, 1.0);
+  // in the hand-off the appendix is a sheet of its own, lying on the next plate's drawing: its top edge was
+  // torn off at the perforation (the bridges between the slots stand proud) and slides into view in the chase
+  float sheet = 1.0;
+  if (sheetTop > -1e8) {
+    float f = fract((pp.x + 1400.0) / 18.0);
+    float edge = sheetTop - 2.2 * smoothstep(0.42, 0.5, f) * smoothstep(1.0, 0.92, f) - 0.5 * snoise(vec2(pp.x * 0.35, 4.0));
+    float w = 0.7 / (zoom * PX_SCALE);
+    sheet = smoothstep(edge - w, edge + w, pp.y);
+  }
+  fragColor = vec4(col, sheet);
 }`;
 
 
-const TEAR_FRAG = /* glsl */ `
+const BURN_FRAG = /* glsl */ `
 uniform sampler2D page;
-uniform vec3 inv0a; uniform vec3 inv0b;   // piece 0: screen -> original screen
-uniform vec3 inv1a; uniform vec3 inv1b;
-uniform float tear;        // 0 = intact
-uniform float tipY;        // how far down the rip has propagated (original px)
-uniform vec2 shade;        // per-piece light multiplier
-uniform float blackout;
+uniform float on;          // 0: the page as it is (opaque); 1: the hand-off, composited over the next plate
+uniform float lineX;       // screen x of the next plate's critical path, where its spark runs
+uniform float slide;       // how far the page has slid down the screen in the chase (px)
+uniform float front;       // the burn front, in page coordinates (screen y before the slide)
+uniform vec2 spark;        // the spark head on screen
+uniform float open;        // the halves' swing (rad) once the page is in two
+uniform float wake;        // their lift behind the spark while the page still holds (rad)
+uniform float wakeLen;     // over what length behind it (px)
+uniform float glow;        // its light through the page, faded in from the start of the hand-off (0..1)
+uniform float flare;       // the flash of light as it flares up through the page (0..1)
+uniform float time;
 
-float tearX(float y) {
-  return 1000.0 + (y - 540.0) * -0.26 + 52.0 * snoise(vec2(y * 0.0032, 3.1)) + 16.0 * snoise(vec2(y * 0.017, 7.7)) + 4.0 * snoise(vec2(y * 0.07, 1.3));
+const float CAMD = 2200.0;   // camera distance (px): the halves' perspective as they swing up
+const float HINGE = 1250.0;  // the sheet's outer edges, off frame: each half swings about its own
+
+// One half of the page (side -1: left, 1: right) seen at screen px sp: colour + coverage.
+vec4 pageHalf(vec2 sp, float side) {
+  // the half is a plane hinged on the vertical through h, swung up toward the camera by th (which grows
+  // behind the spark while the page holds together): find the page point under this pixel
+  float h = lineX + side * HINGE;
+  float yf = sp.y, u = 0.0, th = 0.0, z = 0.0;
+  for (int i = 0; i < 5; i++) {
+    th = open + wake * smoothstep(0.0, wakeLen, yf - slide - front);
+    float den = side * CAMD * cos(th) - (sp.x - 960.0) * sin(th);
+    u = CAMD * (h - sp.x) / den;
+    z = u * sin(th);
+    yf = 540.0 + (sp.y - 540.0) * (CAMD - z) / CAMD;
+  }
+  float xf = h - side * u;
+  if (u < 0.0 || z > CAMD * 0.85 || side * (xf - lineX) < 0.0) return vec4(0.0);
+  vec4 pg = texture(page, vec2(xf / 1920.0, 1.0 - yf / 1080.0));
+  vec2 q = vec2(xf, yf - slide);           // page coordinates
+  float r = abs(xf - lineX), dist = q.y - front, back = max(dist, 0.0);
+
+  // the burnt gap: a pointed tip at the spark, burning back behind it, ragged
+  float rag = 1.5 * snoise(vec2(q.y * 0.045, side * 3.1)) + 0.7 * snoise(vec2(q.y * 0.21, side * 7.3));
+  // (less a px, so that ahead of the tip, where it is 0, the page is whole)
+  float hw = dist < 0.0 ? 5.0 * sqrt(max(0.0, 1.0 - dist * dist / 81.0)) : 5.0 + 11.0 * (1.0 - exp(-back / 180.0));
+  hw += rag * smoothstep(0.0, 50.0, back) * (1.0 + back / 400.0) - 1.0;
+  float e = r - hw;                         // px into the paper from the burnt edge
+  float cover = smoothstep(-0.7 / PX_SCALE, 0.7 / PX_SCALE, e) * pg.a;
+  if (cover <= 0.0) return vec4(0.0);
+  vec3 col = pg.rgb;
+
+  // the edge cools behind the spark, like the trail it rides
+  float heat = exp(-back / 300.0) * smoothstep(-12.0, 0.0, dist);
+  // scorch: browned paper, wider further back, and a bow wave just ahead of the tip
+  float sw = 5.0 + 18.0 * (1.0 - exp(-back / 260.0));
+  float sc = exp(-max(e, 0.0) / sw) * smoothstep(-30.0, 5.0, dist);
+  sc = max(sc, exp(-r / 12.0) * exp(min(dist, 0.0) / 20.0));
+  col *= mix(vec3(1.0), vec3(0.58, 0.40, 0.27), sat(sc) * 0.95);
+  // char: a crumbly black band along the edge
+  float cw = 1.6 + 3.4 * (1.0 - exp(-back / 220.0));
+  float ch = (1.0 - smoothstep(0.0, cw, e + 0.8 * snoise(vec2(q.y * 0.6, side * 5.0)))) * smoothstep(-9.0, -3.0, dist);
+  col = mix(col, C_INK * 0.4, ch);
+  // the glowing rim: white-hot at the tip, signal, blood, out
+  float rim = exp(-max(e, 0.0) / 1.2);
+  float flick = 0.6 + 0.4 * snoise(vec2(q.y * 0.07 + side * 11.0, time * 6.0));
+  vec3 rc = mix(C_BLOOD * 0.8, C_SIGNAL * 1.6, smoothstep(0.05, 0.4, heat));
+  rc = mix(rc, C_EMBER * 3.2, smoothstep(0.6, 1.0, heat));
+  col += rc * rim * smoothstep(0.02, 0.12, heat) * flick;
+
+  // the spark's light: through the paper while it is still underneath (the ink stops it), on the paper
+  // around the hole
+  float d = length(sp - spark);
+  float ahead = smoothstep(-2.0, -30.0, dist);
+  float clear = sat(luma(pg.rgb) / luma(C_BONE)) * (1.0 - ch);
+  float fl = 1.0 + 1.5 * flare;
+  col += C_SIGNAL * (0.9 * exp(-d / 80.0) + 0.3 * exp(-d / (260.0 * fl))) * fl * ahead * clear * glow;
+  col *= 1.0 + C_EMBER * (1.4 * exp(-d / 30.0) + 0.25 * exp(-d / (120.0 * fl))) * fl * (1.0 - ahead);
+
+  // the half turns away from the raking light (from the upper left) as it swings up
+  col *= clamp(mix(1.0, cos(th) - 0.5 * side * sin(th), 0.85), 0.15, 1.2);
+  return vec4(col, cover);
 }
-vec4 piece(vec2 sp, vec3 ia, vec3 ib, float side, float sh) {
-  vec2 q = vec2(dot(ia, vec3(sp, 1.0)), dot(ib, vec3(sp, 1.0)));
-  if (q.x < -2.0 || q.x > 1922.0 || q.y < -2.0 || q.y > 1082.0) return vec4(0.0);
-  float torn = q.y < tipY ? 1.0 : 0.0;
-  float d = (q.x - tearX(q.y)) * side;     // >0 : inside this piece's half
-  // fibrous fuzz along the torn edge (each side has its own fibres)
-  float fuzz = 1.6 * snoise(vec2(q.y * 0.45, side * 5.0)) + 1.2 * snoise(vec2(q.y * 1.7, side * 9.0));
-  fuzz += 5.0 * pow(sat(snoise(vec2(q.y * 0.9, side * 13.0))), 6.0); // stray fibres
-  float edge = d + fuzz * torn;
-  float inside = torn > 0.5 ? smoothstep(-0.7, 0.7, edge) : 1.0;
-  // outer frame edge (the page border when it moves)
-  float bx = min(min(q.x, 1920.0 - q.x), min(q.y, 1080.0 - q.y));
-  inside *= smoothstep(-0.7, 0.7, bx);
-  if (inside <= 0.0 || (torn < 0.5 && d < 0.0)) return vec4(0.0);
-  vec3 c = texture(page, vec2(q.x / 1920.0, 1.0 - q.y / 1080.0)).rgb * sh;
-  // exposed white fibre band along the tear (wider, irregular on one side)
-  float bw = (side > 0.0 ? 5.5 : 2.2) * (0.6 + 0.8 * sat(0.5 + 0.5 * snoise(vec2(q.y * 0.05, side))));
-  float band = (1.0 - smoothstep(0.0, bw, edge)) * torn;
-  c = mix(c, C_BONE * 1.03, band * 0.9);
-  // a little shading just inside the torn edge
-  c *= 1.0 - 0.12 * (1.0 - smoothstep(bw, bw + 5.0, edge)) * torn;
-  return vec4(c, inside);
-}
+
 void main() {
   vec2 sp = vec2(vUv.x * 1920.0, (1.0 - vUv.y) * 1080.0);
-  if (tear <= 0.0) { fragColor = vec4(texture(page, vUv).rgb * (1.0 - blackout), 1.0); return; }
-  vec3 col = C_INK * 0.45;
-  vec4 a = piece(sp, inv0a, inv0b, -1.0, shade.x);
-  col = mix(col, a.rgb, a.a);
-  vec4 b = piece(sp, inv1a, inv1b, 1.0, shade.y);
-  col = mix(col, b.rgb, b.a);
-  fragColor = vec4(col * (1.0 - blackout), 1.0);
+  if (on < 0.5) { fragColor = vec4(texture(page, vUv).rgb, 1.0); return; }
+  vec4 a = pageHalf(sp, -1.0), b = pageHalf(sp, 1.0);
+  float al = a.a + b.a;
+  fragColor = vec4((a.rgb * a.a + b.rgb * b.a) / max(al, 1e-4), sat(al));
 }`;
 
 type Xf = { a: number; b: number; c: number; d: number; e: number; f: number };
@@ -212,14 +274,15 @@ export default class Bureau extends Scene {
     inkTex: { value: null }, camA: { value: new THREE.Vector3() }, camB: { value: new THREE.Vector3() },
     blurV: { value: new THREE.Vector2() }, zoom: { value: 1 },
     st0: { value: new THREE.Vector4() }, st0b: { value: new THREE.Vector4() },
-    st1: { value: new THREE.Vector4() }, st1b: { value: new THREE.Vector4() },
+    st1: { value: new THREE.Vector4() }, st1b: { value: new THREE.Vector4() }, sheetTop: { value: -1e9 },
   });
-  tearPass = new FSPass(TEAR_FRAG, {
-    page: { value: null }, inv0a: { value: new THREE.Vector3(1, 0, 0) }, inv0b: { value: new THREE.Vector3(0, 1, 0) },
-    inv1a: { value: new THREE.Vector3(1, 0, 0) }, inv1b: { value: new THREE.Vector3(0, 1, 0) },
-    tear: { value: 0 }, tipY: { value: 0 }, shade: { value: new THREE.Vector2(1, 1) }, blackout: { value: 0 },
-  });
+  burnPass = new FSPass(BURN_FRAG, {
+    page: { value: null }, on: { value: 0 }, lineX: { value: W / 2 }, slide: { value: 0 }, front: { value: 1e4 },
+    spark: { value: new THREE.Vector2() }, open: { value: 0 }, wake: { value: 0 }, wakeLen: { value: 1 }, glow: { value: 0 }, flare: { value: 0 }, time: { value: 0 },
+  }, { blending: THREE.NormalBlending, transparent: true });
   pdoom!: PDoom;
+  /** The next plate, rendered here under the last page for the hand-off. */
+  next!: LeftTurn;
 
   // lyric anchors
   L1!: Line; L2!: Line; L3!: Line;
@@ -231,7 +294,11 @@ export default class Bureau extends Scene {
 
   // key times
   T0 = 0; tCR = 0; tStamp = 0; tSig = 0; tFiled = 0; tWhipB = 0; tFwd = 0; tBack0 = 0; tBack1 = 0; tRep0 = 0; tRep1 = 0;
-  tNow = 0; tReveal = 0; tPunch = 0; tObs = 0; tStrike2 = 0; tTear = 0; tEnd = 0;
+  tNow = 0; tReveal = 0; tPunch = 0; tObs = 0; tStrike2 = 0; tEnd = 0;
+  // the hand-off: the spark's light shows through (tGlow), it bursts through (tBurst), the page is in two (tFree)
+  tGlow = 0; tBurst = 0; tFree = 0;
+  /** The sheet's top edge in page coordinates (the screen before the slide). */
+  qTop = 0;
 
   findings: TypeChar[] = [];
   conclusion: TypeChar[] = [];
@@ -287,7 +354,6 @@ export default class Bureau extends Scene {
     this.tNow = Math.min(this.wNow.start, this.L3.start);
     this.tObs = this.wObs.start;
     this.tStrike2 = this.tObs + Math.min(0.22, this.beatLen * 0.5);
-    this.tTear = clamp(nextDown(this.tObs + 0.3), this.tObs + 0.3, this.tEnd - 0.4);
     this.tReveal = au.downbeats.find((d) => d > this.wVon.end - 0.15 && d < this.tObs - 0.6) ?? lerp(this.wNeu.start, this.tObs, 0.2);
     this.tPunch = nearestBeat(lerp(this.tReveal, this.tObs, 0.5));
 
@@ -326,8 +392,16 @@ export default class Bureau extends Scene {
 
     this.sig = strokeText('We', 'script', 120);
     this.obsHand = strokeText('obsolete', 'hscript', 124, 1);
-    // hand-writing of "obsolete": starts with the word and must be done before the tear
-    const wEnd = Math.min(this.wObs.end, this.tTear + 0.02);
+    // the next plate, under the last page: its window as the timeline cuts it (on the beat at/before "Gato")
+    const gato = lyrics.get('Gato').words[0]!.start;
+    this.next = new LeftTurn({ ...this.ctx, id: 'leftturn', params: {}, start: this.ctx.end, end: au.timeOfBeat(Math.floor(au.beatAt(gato + 0.02))) });
+    this.next.embedded = true;
+    await this.next.init();
+    this.tBurst = this.next.T.burst;
+    this.tGlow = this.tBurst - this.beatLen;
+
+    // hand-writing of "obsolete": starts with the word and must be done before the burst
+    const wEnd = Math.min(this.wObs.end, this.tBurst - 0.12);
     const n = this.obsHand.charRange.length;
     this.obsCharTimes = Array.from({ length: n }, (_, i) => [lerp(this.tObs + 0.03, wEnd, i / n), lerp(this.tObs + 0.03, wEnd, (i + 1) / n)] as [number, number]);
 
@@ -335,6 +409,19 @@ export default class Bureau extends Scene {
     const counts = [4, 6, 6, 3];
     const xs = [-600, -200, 200, 600];
     this.layers = counts.map((n, i) => ({ x: xs[i]!, ys: Array.from({ length: n }, (_, j) => (j - (n - 1) / 2) * 78) }));
+
+    // ---- the hand-off: the page is in two once the burn front has passed the sheet's top edge (just off the
+    // top of the frame where the camera stopped)
+    const m0 = camXf(this.camAt(this.tGlow));
+    this.qTop = apply(m0, apply(invXf(m0), W / 2, 0).x, C.y + SHEET_TOP).y;
+    let lo = this.tBurst, hi = this.tEnd;
+    for (let i = 0; i < 30; i++) { const mid = (lo + hi) / 2; if (this.frontAt(mid) > this.qTop) lo = mid; else hi = mid; }
+    this.tFree = hi;
+  }
+
+  /** The burn front in page coordinates: the spark's height on screen, less the page's slide. */
+  frontAt(t: number) {
+    return this.next.sparkScreen(t).y - HANDOFF.slideK * this.next.slide(t);
   }
 
   // ------------------------------------------------------------------ timing helpers
@@ -355,7 +442,6 @@ export default class Bureau extends Scene {
     amp += 30 * pulse(t, this.tStamp, 0.07);
     amp += 11 * pulse(t, this.tFiled, 0.06);
     amp += 14 * pulse(t, this.tObs, 0.06) + 9 * pulse(t, this.tStrike2, 0.06);
-    amp += 6 * pulse(t, this.tTear, 0.08);
     for (const s of this.syl) amp += 5 * pulse(t, s[0], 0.05);
     if (t >= this.tRep0 && t < this.tRep1 + 0.2) {
       const seg = (this.tRep1 - this.tRep0) / 3;
@@ -440,7 +526,8 @@ export default class Bureau extends Scene {
     let cam = lerpCam(tight, wide, k);
     const punch: Cam = { x: C.x + 10, y: C.y - 20, z: 0.99, r: -0.004 };
     cam = lerpCam(cam, punch, prog(t, this.tPunch - 0.03, this.tPunch + 0.25, ease.outExpo));
-    cam.z *= 1 + 0.03 * prog(t, this.tPunch, this.tTear, ease.linear);
+    // a slow creep in (3 % a second), held through the hand-off
+    cam.z *= 1 + 0.031 * clamp(Math.min(t, this.tGlow) - this.tPunch, 0, 2);
     cam.z *= 1 + 0.04 * pulse(t, this.tObs, 0.08) + 0.03 * pulse(t, this.tStrike2, 0.08);
     return cam;
   }
@@ -449,16 +536,23 @@ export default class Bureau extends Scene {
   render(f: Frame, out: THREE.WebGLRenderTarget): PostOverrides {
     const { renderer } = this.ctx;
     const t = f.t;
+    // the hand-off: from the first light under the page, the next plate is rendered here, under it
+    const hand = t >= this.tGlow;
+    const nextPost = hand ? this.next.render(f, out) ?? {} : {};
     const cam = this.camAt(t);
     cam.z *= 1 + 0.05 * pulse(t, this.tStamp, 0.09) + 0.018 * pulse(t, this.tFiled, 0.07);
     const [shx, shy] = this.shake(t);
     const m = camXf(cam, shx, shy);
+    // in the chase the page slides down with the drawing under it
+    const slide = hand ? HANDOFF.slideK * this.next.slide(t) : 0;
+    m.f += slide;
     const im = invXf(m);
 
-    // motion blur: centre displacement over one frame, only on whips / carriage return (never across cuts)
+    // motion blur: centre displacement over one frame, only on whips / carriage return (never across cuts;
+    // the chase is blurred by the sub-frames)
     let bl: [number, number] = [0, 0];
     const dtb = 1 / 60;
-    if (!this.cutBetween(t - dtb, t)) {
+    if (!hand && !this.cutBetween(t - dtb, t)) {
       const m2 = camXf(this.camAt(t - dtb));
       const pc = apply(im, W / 2 + shx, H / 2 + shy);
       const q = apply(m2, pc.x, pc.y);
@@ -477,11 +571,11 @@ export default class Bureau extends Scene {
     const view = this.viewRect(im);
     if (view.y0 < A.y + 800 && view.y1 > A.y - 800) this.drawForm(c, t);
     if (view.y0 < A.y + 800 && view.y1 > A.y + 700) this.drawPerforation(c, A.y + 760);
-    if (view.y0 < B.y + 800 && view.y1 > B.y - 800) {
+    if (!hand && view.y0 < B.y + 800 && view.y1 > B.y - 800) {
       const rb = this.remapB(t);
       this.drawAnnex(c, rb.tr, t, rb.loop);
     }
-    if (view.y0 < B.y + 800 && view.y1 > B.y + 700) this.drawPerforation(c, B.y + 760);
+    if (!hand && view.y0 < B.y + 800 && view.y1 > B.y + 700) this.drawPerforation(c, B.y + 760);
     if (view.y0 < C.y + 800 && view.y1 > C.y - 800) this.drawAppendix(c, t);
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.globalCompositeOperation = 'source-over';
@@ -493,6 +587,7 @@ export default class Bureau extends Scene {
     (P.camB!.value as THREE.Vector3).set(im.b, im.d, im.f);
     (P.blurV!.value as THREE.Vector2).set(bl[0], bl[1]);
     P.zoom!.value = cam.z;
+    P.sheetTop!.value = hand ? C.y + SHEET_TOP : -1e9;
     const sA = this.stampSafe(t), sF = this.stampFiled(t);
     (P.st0!.value as THREE.Vector4).set(sA.x, sA.y, sA.hw * 1.12, sA.hh * 1.12);
     (P.st0b!.value as THREE.Vector4).set(sA.rot, sA.on ? sA.strength : 0, 3.7, 0);
@@ -500,46 +595,36 @@ export default class Bureau extends Scene {
     (P.st1b!.value as THREE.Vector4).set(sF.rot, sF.on ? 1.0 : 0, 9.1, 0);
     this.paper.render(renderer, this.pageRT);
 
-    // ---- tear
-    const T = this.tearPass.u;
-    T.page!.value = this.pageRT.texture;
-    const tt = t - this.tTear;
-    // the engine HUD (FIG caption, crop marks) is printed in ink while the page is up (paper: 1); it
-    // blinks off as the page rips and comes back in bone over the black
-    let hudA = 1, paperA = 1;
-    if (tt > 0) {
-      const rip = prog(tt, 0, 0.13, ease.outQuad);
-      const fall = Math.max(0, tt - 0.1);
-      const cx = 1000;
-      const pieceXf = (side: number) => {
-        // hinge about the rip tip while tearing, then tumble away from camera
-        const hinge = 0.06 * rip * side;
-        const sc = 1 / (1 + fall * 1.9 + fall * fall * 3);
-        const ang = hinge + side * (fall * 1.6 + fall * fall * 5);
-        const pivot = { x: cx + side * 30, y: lerp(0, 1080, rip) };
-        const off = { x: side * (40 * rip + 1400 * fall * fall), y: 2600 * fall * fall + 150 * fall };
-        const cs = Math.cos(ang) * sc, sn = Math.sin(ang) * sc;
-        const fw = { a: cs, b: sn, c: -sn, d: cs, e: pivot.x + off.x - (cs * pivot.x - sn * pivot.y), f: pivot.y + off.y - (sn * pivot.x + cs * pivot.y) };
-        return invXf(fw);
-      };
-      const i0 = pieceXf(-1), i1 = pieceXf(1);
-      (T.inv0a!.value as THREE.Vector3).set(i0.a, i0.c, i0.e);
-      (T.inv0b!.value as THREE.Vector3).set(i0.b, i0.d, i0.f);
-      (T.inv1a!.value as THREE.Vector3).set(i1.a, i1.c, i1.e);
-      (T.inv1b!.value as THREE.Vector3).set(i1.b, i1.d, i1.f);
-      T.tear!.value = 1;
-      T.tipY!.value = lerp(-20, 1120, rip);
-      (T.shade!.value as THREE.Vector2).set(1 - 0.4 * clamp(fall * 3), 1 - 0.3 * clamp(fall * 3));
-      T.blackout!.value = prog(t, this.tEnd - 0.04, this.tEnd, ease.linear);
-      hudA = tt < 0.1 ? 1 - prog(tt, 0, 0.06) : prog(tt, 0.12, 0.35, ease.inOutCubic);
-      paperA = tt < 0.1 ? 1 : 0;
-    } else {
-      T.tear!.value = 0;
-      T.blackout!.value = 0;
+    // ---- the page (in the hand-off: burnt in two along the spark's path, over the next plate)
+    const U = this.burnPass.u;
+    U.page!.value = this.pageRT.texture;
+    U.on!.value = hand ? 1 : 0;
+    if (hand) {
+      const sp = this.next.sparkScreen(t);
+      U.lineX!.value = sp.x;
+      U.slide!.value = slide;
+      U.front!.value = sp.y - slide;
+      (U.spark!.value as THREE.Vector2).set(sp.x, sp.y);
+      U.open!.value = 1.35 * ease.inQuad(prog(t, this.tFree, this.tEnd - 0.01));
+      U.wake!.value = HANDOFF.wake;
+      U.wakeLen!.value = HANDOFF.wakeLen;
+      U.glow!.value = prog(t, this.tGlow, this.tGlow + 0.25, ease.inQuad);
+      U.flare!.value = pulse(t, this.tBurst, 0.07);
+      U.time!.value = t;
     }
-    this.tearPass.render(renderer, out);
+    this.burnPass.render(renderer, out);
 
-    return { hud: hudA, paper: paperA, bloom: 0.2, bloomThreshold: 1.8, halation: 0.04, vignette: 0.18, grain: 0.045, ca: 0.5 };
+    const own: PostOverrides = { hud: 1, paper: 1, bloom: 0.2, bloomThreshold: 1.8, halation: 0.04, vignette: 0.18, grain: 0.045, ca: 0.5 };
+    if (!hand) return own;
+    // the spark, over the page: through the hole it burns, then over the next plate's line as the halves part
+    this.next.renderSpark(out, t);
+    // the post goes over to the next plate's as the page swings away, exactly by the cut
+    const k = prog(t, this.tFree - 0.05, this.tEnd - 0.03, ease.inOutQuad);
+    const post = mixPost(own, nextPost, k);
+    const kick = (6 * pulse(t, this.tBurst, 0.05) + 5 * pulse(t, this.tFree, 0.05)) * (1 - k);
+    const ph = frameIdx(t);
+    post.shake = [post.shake![0] + kick * (hash(ph, 21) - 0.5) * 2, post.shake![1] + kick * (hash(ph, 22) - 0.5) * 2];
+    return post;
   }
 
   viewRect(im: Xf) {
@@ -1092,6 +1177,19 @@ export default class Bureau extends Scene {
   override dispose() {
     this.pageRT.dispose();
   }
+}
+
+/** Post overrides blended from a to b by k (a key one side leaves out is the engine default there). */
+function mixPost(a: PostOverrides, b: PostOverrides, k: number): PostOverrides {
+  const out: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)]) as Set<keyof PostParams>) {
+    const x = a[key] ?? DEFAULT_POST[key], y = b[key] ?? DEFAULT_POST[key];
+    if (typeof x === 'number' && typeof y === 'number') out[key] = lerp(x, y, k);
+    else if (Array.isArray(x) && Array.isArray(y)) out[key] = [lerp(x[0], y[0], k), lerp(x[1], y[1], k)];
+    else out[key] = k < 0.5 ? x : y;
+  }
+  out.shake ??= [0, 0];
+  return out as PostOverrides;
 }
 
 /** Written length of a StrokeText with explicit per-char [start, end] times. */

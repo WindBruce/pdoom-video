@@ -229,6 +229,13 @@ export function makeMarksTexture(): THREE.DataTexture {
   return t;
 }
 
+/** The drawing and the road markings, built once: `bureau` also renders this plate, under its last page. */
+let shared: { map: THREE.Texture; marks: THREE.DataTexture } | null = null;
+export function mapTextures() {
+  shared ??= { map: canvasTex(drawMap(), true), marks: makeMarksTexture() };
+  return shared;
+}
+
 export function canvasTex(cv: HTMLCanvasElement, srgb: boolean) {
   const t = new THREE.CanvasTexture(cv);
   t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
@@ -326,11 +333,12 @@ vec2 toWorld(vec2 fc, vec4 cam) {
   return cam.xy + w;
 }
 
-// distance to the route and arc length at the closest point
+// distance to the route and arc length at the closest point (negative south of YOU ARE HERE: the run-in
+// from under the bureau's page)
 vec2 route(vec2 p) {
   float LA = Y0 - (TY + RT);
   float LC = RT * 1.5707963;
-  float yA = clamp(p.y, TY + RT, Y0);
+  float yA = clamp(p.y, TY + RT, Y0 + 4000.0);
   float dA = length(p - vec2(PX, yA));
   float sA = Y0 - yA;
   vec2 cc = vec2(PX - RT, TY + RT);

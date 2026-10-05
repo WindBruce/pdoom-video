@@ -875,7 +875,6 @@ export default class LossScene extends Scene {
     c.save();
     c.font = font(fam, 100);
     c.textBaseline = 'alphabetic';
-    c.lineJoin = 'round';
     for (const g of this.glyphs3) {
       if (t < g.t0 || g.ch === ' ') continue;
       const ap = prog(t, g.t0, g.t0 + 0.16, ease.outBack as (x: number) => number);
@@ -895,8 +894,6 @@ export default class LossScene extends Scene {
       c.save();
       c.translate(qa.x, qa.y); c.rotate(ang);
       c.scale(clamp(adv / gw, 0.05, (size / 100) * 1.1), (size / 100) * (0.3 + 0.7 * ap));
-      c.strokeStyle = rgba('ink', 0.9 * fade); c.lineWidth = 16;
-      c.strokeText(g.ch, 0, 0);
       c.fillStyle = heatCss(heat, fade);
       c.fillText(g.ch, 0, 0);
       c.restore();

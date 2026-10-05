@@ -259,25 +259,40 @@ vec3 lightAt(vec3 p, vec3 n) {
 }
 
 // ------------------------------------------------------------------ engraving
-float hatchW(float u, float cov, float fw) {
-  // box-filtered coverage of a line of half-width hw (line units) by a footprint of half-width aa
-  float d = 0.5 - abs(fract(u) - 0.5);           // distance to the nearest line
-  float hw = 0.5 * clamp(cov, 0.0, 1.0);
-  float aa = max(fw * 0.5, 1e-3);
-  float l = clamp(min(d + aa, hw) - max(d - aa, -hw), 0.0, 2.0 * aa) / (2.0 * aa);
-  return mix(l, clamp(cov, 0.0, 1.0), smoothstep(0.35, 0.8, fw));
+// The hatching is band-limited where it is drawn, so it can't beat against the pixel grid (moiré) at
+// any output scale: the line density is LOD'd (the spacing doubles, the in-between lines fading out)
+// so lines are never closer than HATCH_PX logical px, and each line is drawn as seen through a
+// Gaussian pixel filter (sd HATCH_SD physical px; ~0.6 px with the 4 rotated-grid taps), which leaves
+// next to nothing of a pattern's harmonics past the pixel frequency; a pattern finer than that is
+// its mean ink.
+const float HATCH_PX = 2.5;  // in-between lines are gone at this spacing, full at twice it
+const float HATCH_SD = 0.5;
+float erfA(float x) {        // Abramowitz & Stegun 7.1.27, |error| < 5e-4
+  float a = abs(x), t = 1.0 + (0.278393 + (0.230389 + 0.078108 * a * a) * a) * a;
+  t *= t;
+  return sign(x) * (1.0 - 1.0 / (t * t));
 }
-/** Lines at integer u (world spacing already divided out), density-LOD'd to >= ~3.2 px apart. */
+/** Coverage of lines of half-width hw at integer u (period 1), through a Gaussian of sd sig (u units). */
+float lineG(float u, float hw, float sig) {
+  float d = fract(u + 0.5) - 0.5, k = 0.7071068 / max(sig, 1e-5);
+  float c = erfA((d + hw) * k) - erfA((d - hw) * k)                      // the nearest line
+          + erfA((d - 1.0 + hw) * k) - erfA((d - 1.0 - hw) * k)          // and its neighbours
+          + erfA((d + 1.0 + hw) * k) - erfA((d + 1.0 - hw) * k);
+  return mix(0.5 * c, 2.0 * hw, smoothstep(0.18, 0.3, sig));
+}
+/** The filter's sd in u units, from fw = |grad u| per logical px. */
+float hatchSig(float fw) { return HATCH_SD * fw / PX_SCALE; }
+/** Lines at integer u (world spacing already divided out) with ink cov; fw = |grad u| per logical px. */
 float hatchLOD(float u, float cov, float fw) {
-  float lv = log2(max(fw * 3.2, 1e-5));
-  float l0 = max(floor(lv), 0.0);
-  float k = lv > 0.0 ? fract(lv) : 0.0;
+  // LOD by the logical-px footprint (the same line density at any output scale), filtered per physical px
+  float lv = log2(max(fw * HATCH_PX, 1e-6));
+  float l0 = max(ceil(lv), 0.0);                // the finest level whose lines are >= HATCH_PX apart
   float s0 = exp2(l0), s1 = s0 * 2.0;
-  // (LOD by the logical-px footprint fw — the same line density at any output scale; AA per physical px)
-  float h0 = hatchW(u / s0, cov, fw / (s0 * PX_SCALE)), h1 = hatchW(u / s1, cov, fw / (s1 * PX_SCALE));
-  return mix(h0, h1, smoothstep(0.1, 0.9, k));
+  float w = smoothstep(0.0, 1.0, l0 - lv);      // = log2(its spacing / HATCH_PX): its odd lines fade in
+  float hw = 0.5 * clamp(cov, 0.0, 1.0), sig = hatchSig(fw);
+  return mix(lineG(u / s1, hw, sig / s1), lineG(u / s0, hw, sig / s0), w);
 }
-/** Pixel footprint of the world coordinate dot(p, axis) around a planar hit (neighbour-ray/plane intersections). */
+/** |grad| per logical px of the world coordinate dot(p, axis) around a planar hit (neighbour-ray/plane intersections). */
 float footprint(vec3 p, vec3 n, vec3 axis) {
   vec3 ro = camPos;
   float dn = dot(p - ro, n);
@@ -285,7 +300,7 @@ float footprint(vec3 p, vec3 n, vec3 axis) {
   float ax = dot(rx, n), ay = dot(ry, n);
   vec3 px = ro + rx * (dn / (abs(ax) < 1e-4 ? -1e-4 : ax));
   vec3 py = ro + ry * (dn / (abs(ay) < 1e-4 ? -1e-4 : ay));
-  return max(abs(dot(px - p, axis)), abs(dot(py - p, axis)));
+  return length(vec2(dot(px - p, axis), dot(py - p, axis)));
 }
 float toneOf(vec3 E) { float l = max(E.r, max(E.g, E.b)); return 1.0 - exp(-l * 2.2); }
 
@@ -298,13 +313,16 @@ vec3 shade(vec3 ro, vec3 rd, float t, float mat) {
   vec3 lc = E / max(max(E.r, max(E.g, E.b)), 1e-4);     // light hue (normalised)
   vec3 ink = C_BONE * 0.8;
   vec3 axis; float sp; float extra = 0.0;
+  float u0 = 0.0;                        // hatch coordinate origin along axis
+  float relief = 1.0;                    // 0: mean ink only (where the hatch can't be resolved)
   vec3 col = C_INK * 0.25;
   vec4 decal = vec4(0.0);
   if (mat < 1.5) {                       // stage boards, running up/downstage
     axis = vec3(1.0, 0.0, 0.0); sp = 0.012;
     float plank = floor(p.x / 0.15);
-    float seam = 1.0 - smoothstep(0.004, 0.008, abs(fract(p.x / 0.15 + 0.5) - 0.5) * 0.15);
-    float butt = 1.0 - smoothstep(0.003, 0.007, abs(fract(p.z / 2.4 + hash11(plank) ) - 0.5) * 2.4);
+    // seams and butt joints, filtered like the hatch (upstage they thin to sub-pixel slivers)
+    float seam = lineG(p.x / 0.15, 0.04, hatchSig(footprint(p, n, vec3(1.0, 0.0, 0.0)) / 0.15));
+    float butt = lineG(p.z / 2.4 + hash11(plank) - 0.5, 0.0021, hatchSig(footprint(p, n, vec3(0.0, 0.0, 1.0)) / 2.4));
     tone *= (0.82 + 0.3 * hash11(plank * 3.7)) * (1.0 - 0.85 * max(seam, butt));
     if (stageOn > 0.5 && p.z > 3.6) { axis = vec3(0.0, 0.0, 1.0); tone *= 0.7; }
     // spike marks where the props stood (only once they have been struck)
@@ -326,9 +344,11 @@ vec3 shade(vec3 ro, vec3 rd, float t, float mat) {
   } else if (mat < 3.5) {                // laptop base: keys in the deck, lit when the lid closes
     axis = vec3(0.0, 0.0, 1.0); sp = 0.0022;
     if (n.y > 0.7) {
-      vec2 k = (p.xz - vec2(0.0, -0.035)) / vec2(0.0185, 0.0185);
-      vec2 kf = abs(fract(k) - 0.5);
-      float key = step(abs(p.x), 0.135) * step(abs(p.z + 0.035), 0.062) * step(max(kf.x, kf.y), 0.4);
+      // keys 0.8 of the pitch: the gaps are lines at integer k (filtered: rows crowd at deck level)
+      vec2 k = (p.xz - vec2(0.0, -0.035)) / 0.0185;
+      float kx = 1.0 - lineG(k.x, 0.1, hatchSig(footprint(p, n, vec3(1.0, 0.0, 0.0)) / 0.0185));
+      float kz = 1.0 - lineG(k.y, 0.1, hatchSig(footprint(p, n, vec3(0.0, 0.0, 1.0)) / 0.0185));
+      float key = step(abs(p.x), 0.135) * step(abs(p.z + 0.035), 0.062) * kx * kz;
       tone *= 0.55 + 0.6 * key;
       float pad = step(abs(p.x), 0.05) * step(abs(p.z - 0.07), 0.028);
       tone *= 1.0 - 0.35 * pad;
@@ -346,18 +366,23 @@ vec3 shade(vec3 ro, vec3 rd, float t, float mat) {
       }
       return C_INK * 0.3 + C_BONE * 0.02 * tone;       // bezel
     }
-    axis = lidD(); sp = 0.0035;
+    // lines fixed to the lid (in world coordinates they would slide over it as it turns)
+    axis = lidD(); sp = 0.0035; u0 = dot(HINGE, axis);
     // the back: dark aluminium and the owner's stickers, just caught by the room's faint bounce
-    // (more toward the top edge, which the screen's halo rims)
+    // (more toward the top edge, which the screen's halo rims). Only the flat back: the rounded edges
+    // stay dark and unhatched (seen edge-on as the lid closes, their hatch phase runs through many
+    // lines within a pixel, which a tangent-plane footprint can't see: a line crawled along the top)
+    relief = smoothstep(0.9, 0.97, dot(n, -lidN()));
     float rim = smoothstep(0.35, 1.0, l.y / LID_L);
     float bounce = clamp(screenI, 0.0, 1.0) * props;
-    tone = max(tone * 0.5, (0.013 + 0.02 * rim) * bounce);
+    tone = max(tone * 0.5, (0.013 + 0.02 * rim) * bounce * relief);
     vec4 sk = texture(stickerTex, vec2(0.5 - l.x / 0.31, l.y / LID_L));
     decal = vec4(sk.rgb * (0.105 + 0.065 * rim) * bounce * mix(vec3(1.0), C_EMBER / max(C_EMBER.r, 1e-3), 0.12), sk.a);
   } else if (mat < 5.5) {                // chair
     axis = vec3(0.0, 1.0, 0.0); sp = 0.006;
   } else if (mat < 6.5) {                // arch
     if (abs(n.z) > 0.7 && abs(p.x) > 4.06 && abs(p.x) < 4.78 && p.y < 4.9) { axis = vec3(1.0, 0.0, 0.0); sp = 0.045; }  // fluted pilasters
+    else if (abs(n.y) > 0.7) { axis = vec3(0.0, 0.0, 1.0); sp = 0.03; }   // soffits and tops
     else { axis = vec3(0.0, 1.0, 0.0); sp = 0.03; }
   } else if (mat < 7.5) {                // curtain: blood velvet, lines along the folds
     float fu; mapCurtain(p, fu);
@@ -380,7 +405,9 @@ vec3 shade(vec3 ro, vec3 rd, float t, float mat) {
     tone *= 0.5;
   }
   float fp = footprint(p, n, axis) / sp;
-  float cov = hatchLOD(dot(p, axis) / sp, tone * 1.05, fp);
+  // a face square to the axis has one hatch phase all over it (all ink or none): mean ink there
+  relief *= smoothstep(0.15, 0.4, length(axis - n * dot(axis, n)));
+  float cov = mix(min(tone * 1.05, 1.0), hatchLOD((dot(p, axis) - u0) / sp, tone * 1.05, fp), relief);
   return mix(mix(col, ink * mix(vec3(1.0), lc, 0.5), cov), decal.rgb, decal.a);
 }
 

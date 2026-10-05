@@ -48,7 +48,7 @@ function project(c: Cam, p: V3): { x: number; y: number; z: number } {
 
 // ------------------------------------------------------------------ scene
 interface Times {
-  start: number; end: number; db1: number; splits: number[]; fill: number; tilt0: number; tilt1: number;
+  start: number; end: number; db1: number; splits: number[]; fill: number; clear: number; tilt0: number; tilt1: number;
   card0: number; card1: number; d0: number; slams: number[];
 }
 
@@ -57,10 +57,13 @@ const camUniforms = () => ({
   focal: { value: FOCAL }, res: { value: new THREE.Vector2(W, H) }, time: { value: 0 }, ssTap: SS_TAP,
   keyDir: { value: new THREE.Vector3() }, keyI: { value: 1 }, rimDir: { value: new THREE.Vector3() }, rimI: { value: 1 },
   lampPos: { value: new THREE.Vector3() }, lampI: { value: 0 },
-  fillT: { value: -1 }, groupHalf: { value: new THREE.Vector2(80, 80) },
+  fillT: { value: -1 }, groupHalf: { value: new THREE.Vector2(80, 80) }, holdT: { value: 0 },
 });
 
 const LEAD = 26; // lead-in length of the spark's line before it bends into the clip
+// phase A keeps the top of the frame for "as paperclips fill the room": the group is framed between
+// the band and the bottom margin, and the flood leaves the band alone until the line has gone
+const BAND = 240, FOOT = 56;
 
 export default class Paperclips extends Scene {
   top = new FSPass(FRAG_TOP, {
@@ -94,10 +97,13 @@ export default class Paperclips extends Scene {
     const d0 = this.L3.start - 0.08;
     const slams = [d0];
     for (let b = Math.round(au.beatAt(d0)) + 1; au.timeOfBeat(b) < end - 0.3 && slams.length < 4; b++) slams.push(au.timeOfBeat(b));
+    // the first line has faded out just before the tilt; only then does the flood take its band
+    const fill = splits[5]! + 0.1, clear = tilt0 - 0.04;
     this.T = {
-      start, end, db1, splits, fill: splits[5]! + 0.1, tilt0, tilt1: tilt0 + 1.0,
+      start, end, db1, splits, fill, clear, tilt0, tilt1: tilt0 + 1.0,
       card0: this.L2.start - 0.42, card1: this.L3.start - 0.3, d0, slams,
     };
+    this.top.u.holdT!.value = this.march.u.holdT!.value = clear - fill;
   }
 
   // ---------------------------------------------------------------- split tree (phase A)
@@ -126,8 +132,12 @@ export default class Paperclips extends Scene {
     return out;
   }
 
-  /** Camera height framing the group (phase A); pulls back a little after each split. */
-  topHeight(t: number) {
+  /**
+   * Top-down camera framing the group (phase A); pulls back a little after each split. The rolled
+   * group fills 80% of the width or 74% of the height, but never rises into the lyric's band: when it
+   * would, it sits lower (and a little smaller) between the band and the foot margin.
+   */
+  topCam(t: number): Cam {
     const T = this.T;
     const ext: [number, number][] = [[17, 5], [17, 10], [17, 20], [40, 20], [40, 40], [80, 40], [80, 80]];
     let hx = ext[0]![0], hy = ext[0]![1];
@@ -135,26 +145,36 @@ export default class Paperclips extends Scene {
       const k = prog(t, T.splits[l]! - 0.2, T.splits[l]! + 0.2, ease.inOutCubic);
       hx = lerp(hx, ext[l + 1]![0], k); hy = lerp(hy, ext[l + 1]![1], k);
     }
+    const roll = lerp(-0.07, 0.04, prog(t, T.start, T.tilt0, ease.inOutQuad)) + noise1(t * 0.6, 3) * 0.015;
+    const cs = Math.abs(Math.cos(roll)), sn = Math.abs(Math.sin(roll));
+    const ex = hx * cs + hy * sn, ey = hx * sn + hy * cs;
     const halfW = W / 2 / FOCAL, halfH = H / 2 / FOCAL;
     // slow push-in while the single clip is alone, then framing
     const push = lerp(1.08, 1.0, prog(t, T.db1, T.splits[0]!, ease.outCubic));
-    return Math.max(hx / (halfW * 0.8), hy / (halfH * 0.74)) * push;
+    const h = Math.max(ex / (halfW * 0.8), ey / (halfH * 0.74), (2 * ey * FOCAL) / (H - BAND - FOOT)) * push;
+    // slide the camera so the group's centre lands where its top edge clears the band
+    const cy = Math.max(H / 2, BAND + (ey * FOCAL) / h);
+    const cam = lookCam([0, 0, h], [0, 0.0001, -1], roll);
+    const o = ((cy - H / 2) * h) / FOCAL;
+    cam.pos = [cam.U[0] * o, cam.U[1] * o, h];
+    return cam;
   }
 
   camera(t: number): Cam {
     const T = this.T;
-    const drift = noise1(t * 0.6, 3) * 0.015;
-    if (t < T.tilt0) {
-      const roll = lerp(-0.07, 0.04, prog(t, T.start, T.tilt0, ease.inOutQuad)) + drift;
-      return lookCam([0, 0, this.topHeight(t)], [0, 0.0001, -1], roll);
-    }
+    if (t < T.tilt0) return this.topCam(t);
     // swing down on a crane around a target gliding forward on the floor, ending 16 units up
-    const hEnd = this.topHeight(T.tilt0);
+    const drift = noise1(t * 0.6, 3) * 0.015;
+    const top = this.topCam(T.tilt0);
+    const hEnd = top.pos[2];
     const k = prog(t, T.tilt0, T.tilt1, ease.inOutCubic);
     const el = lerp(Math.PI / 2 - 0.0001, 0.175, k);
     const dist = lerp(hEnd, 92, ease.inOutQuad(k));
     const glide = (t - T.tilt0) * 16 * prog(t, T.tilt0, T.tilt0 + 0.6, ease.inQuad);
-    const target: V3 = [lerp(0, -7, k) + Math.sin((t - T.tilt0) * 0.9) * 3 * k, glide + 40 * k, 0];
+    const target: V3 = [
+      lerp(top.pos[0], -7, k) + Math.sin((t - T.tilt0) * 0.9) * 3 * k,
+      top.pos[1] * (1 - k) + glide + 40 * k, 0,
+    ];
     let pos: V3 = [target[0], target[1] - dist * Math.cos(el), dist * Math.sin(el)];
     let fwd = nrm(sub(target, pos));
     // after the swing: ease the gaze up toward the horizon
@@ -292,7 +312,8 @@ export default class Paperclips extends Scene {
   private drawLyricA(c: CanvasRenderingContext2D, t: number) {
     const T = this.T;
     const line = this.L1;
-    const a = prog(t, line.start - 0.4, line.start) * (1 - prog(t, T.tilt0 - 0.25, T.tilt0));
+    // set on the empty band above the group (see BAND): gone before the flood reaches it
+    const a = prog(t, line.start - 0.4, line.start) * (1 - prog(t, T.clear - 0.16, T.clear));
     if (a <= 0) return;
     const fam = F.archivo(100, 300), size = 72;
     let x = 128;
@@ -301,18 +322,9 @@ export default class Paperclips extends Scene {
     c.globalAlpha = a;
     c.font = font(fam, size);
     c.textBaseline = 'alphabetic';
-    c.lineJoin = 'round';
-    // soft scrim so the words stay readable once the clips fill the frame
-    const g = c.createLinearGradient(0, 40, 0, 280);
-    g.addColorStop(0, rgba('ink', 0.0)); g.addColorStop(0.35, rgba('ink', 0.55)); g.addColorStop(1, rgba('ink', 0));
-    c.fillStyle = g;
-    c.fillRect(0, 40, 1100, 240);
     for (const w of line.words) {
       const p = Lyrics.wordProgress(w, t);
       const ww = c.measureText(w.w).width;
-      c.strokeStyle = rgba('ink', 0.9);
-      c.lineWidth = 9;
-      c.strokeText(w.w, x, y);
       c.fillStyle = rgba('bone', 0.3);
       c.fillText(w.w, x, y);
       if (p > 0) {

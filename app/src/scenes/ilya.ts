@@ -58,7 +58,8 @@ export default class IlyaScene extends Scene {
     const endK = smoothstep(T.show.start, this.ctx.end, t);
     return {
       bloom: 0.85 + 0.2 * endK, bloomThreshold: 0.9, bloomKnee: 0.25,
-      vignette: 0.45,
+      // little colour split: it fringes the fine hatching (and loom's dive hands over at 0.5)
+      ca: 0.5, vignette: 0.45,
       shake: [noise1(t * 70, 1) * 7 * slam, noise1(t * 67, 2) * 7 * slam],
       flash: 0.018 * thunk,
       grain: 0.06,

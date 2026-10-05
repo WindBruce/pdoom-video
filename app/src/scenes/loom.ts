@@ -448,8 +448,9 @@ export default class Loom extends Scene {
     c.restore();
     this.ctx.comp.draw(renderer, L.upload(), out);
     const kick = f.a.kick;
+    // the twist's hit: the lens breathes in and its colours split, the frame never washes
     const tw = Math.exp(-Math.abs(t - T.twist) / 0.05);
-    return { zoom: 1 + 0.012 * kick * (1 - dive), ca: 0.5, flash: 0.12 * tw, bloomThreshold: lerp(0.85, 0.9, dive) };
+    return { zoom: 1 + 0.012 * kick * (1 - dive) + 0.02 * tw, ca: 0.5 + 4 * tw, bloomThreshold: lerp(0.85, 0.9, dive) };
   }
 }
 void clamp; void smoothstep;

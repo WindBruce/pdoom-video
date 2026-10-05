@@ -694,7 +694,7 @@ export default class Ascent extends Scene {
     c.restore();
     comp.draw(renderer, L.upload(), out);
 
-    return { paper: 1 - dark, bloom: 0.8, vignette: 0.45, flash: 0.9 * pulse(t, t1 - 0.03, 0.05) * prog(t, t1 - 0.1, t1), zoom: 1 + 0.02 * bp, ca: 1.2 + 2 * k };
+    return { paper: 1 - dark, bloom: 0.8, vignette: 0.45, zoom: 1 + 0.02 * bp, ca: 1.2 + 2 * k };
   }
 
   // ------------------------------------------------------------------ D: the odometer
@@ -848,9 +848,10 @@ export default class Ascent extends Scene {
 
     const sh = pulse(t, tL, 0.07);
     const intro = pulse(t, t0, 0.06);
+    // the odometer arrives out of the point: a punch-out from a tight frame, no white-out
     return {
       bloom: 0.7, vignette: 0.5, shake: [Math.sin(t * 90) * 18 * sh, Math.cos(t * 70) * 12 * sh],
-      ca: 1.2 + 3 * sh, flash: 0.12 * sh + 0.3 * intro,
+      ca: 1.2 + 3 * sh + 4 * intro, zoom: 1 + 0.05 * intro + 0.02 * sh,
     };
   }
 }

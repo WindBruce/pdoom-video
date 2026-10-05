@@ -13,7 +13,7 @@ import type * as THREE from 'three';
 import { Scene, type Frame, type PostOverrides } from '../engine/scene';
 import { FSPass, Layer2D, W, H } from '../engine/gl';
 import { HEX, rgba } from '../engine/palette';
-import { F, font, measure, layout, plain, type TextLayout } from '../engine/type';
+import { F, font, measure, layout, type TextLayout } from '../engine/type';
 import { PDoom, formatPDoom } from '../engine/hud';
 import type { Word } from '../engine/lyrics';
 import { clamp, ease, hash, lerp, noise1, prog, pulse, smoothstep, frameIdx } from '../engine/util';
@@ -58,7 +58,6 @@ export default class Hook extends Scene {
   /** P( and DOOM sung; the instrument's entrance; its roll; the exit window; hook 1's P(DOOM) burst. */
   tP = 0; tDoom = 0; tNum = 0; tRoll0 = 0; tRoll1 = 0; tX0 = 0; tX1 = 0; tSlam = 0;
   dPrev = 0; dNew = 0;
-  prevWord = '';
   lw = 1; // hairline width multiplier (kept constant under the exit transforms)
   f = {
     im: F.archivo(100, 900), up: F.archivo(125, 900), my: F.archivo(62, 900), doom: F.archivo(100, 900),
@@ -75,8 +74,6 @@ export default class Hook extends Scene {
     this.pd = new PDoom(lyrics);
     const line = lyrics.linesIn(start - 0.3, end).find((l) => /upping/i.test(l.text)) ?? lyrics.linesIn(start, end)[0]!;
     this.words = line.words.slice(0, 4);
-    const prev = lyrics.lines[line.i - 1];
-    this.prevWord = prev ? plain(prev.words[prev.words.length - 1]!.w) : ''; // typed (mono): typewriter quotes
     this.ws = this.words.map((w) => w.start);
     const wP = this.words[3] ?? this.words[this.words.length - 1]!;
     this.tP = wP.start;
@@ -199,18 +196,6 @@ export default class Hook extends Scene {
 
   // ------------------------------------------------------------------ words
   private drawPre(c: CanvasRenderingContext2D, t: number, ink: Col) {
-    if (this.n === 3) {
-      // the breakdown: the cursor is still holding on to the last letter, alone in the dark
-      const a = 1 - smoothstep(this.ws[0]! - 0.12, this.ws[0]!, t);
-      const size = 40, adv = size * PADV;
-      const w = this.prevWord.length * adv;
-      c.font = font(this.f.mono, size);
-      c.fillStyle = rgba('bone', 0.8 * a);
-      c.fillText(this.prevWord, W / 2 - w / 2, H / 2 + size * 0.35);
-      c.fillStyle = rgba('signal', a);
-      c.fillRect(W / 2 + w / 2 + 3, H / 2 + size * 0.35 - size * 0.78, 3, size * 0.9);
-      return;
-    }
     const k = ease.outExpo(prog(t, this.ctx.start, this.ws[0]!));
     c.fillStyle = rgba(ink, 0.3);
     c.fillRect(W / 2 - 400 * k, H / 2, 800 * k, 1);

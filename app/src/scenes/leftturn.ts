@@ -1,4 +1,7 @@
 // "Trajectory, revised". Verse 3, part 2. One continuous drawing sheet, the camera never at rest.
+//  0. The run-in (drawn by `bureau`, which renders this plate under its last page): the spark comes up
+//     the critical path from the south, under the page, bursts through it on the beat before the cut and
+//     burns it in two; the held camera picks up the chase as it nears the top, and the halves swing away.
 //  1. "Sharp left turn": a top-down engineering roadmap (SRR · PDR · CDR · TRR · LAUNCH); the
 //     spark runs the planned route, lyrics painted on it as road markings; on "left" it swerves
 //     90° and the camera whips round with it (true multi-tap motion blur), leaving the plan.
@@ -22,7 +25,7 @@ import { F, font, layout } from '../engine/type';
 import { Lyrics, norm, type Line, type Word } from '../engine/lyrics';
 import { clamp, ease, keys, lerp, prog, pulse } from '../engine/util';
 import { sparkHead, sparkParticles } from './_motifs';
-import { MAP, FACE, EYE_R, routeAt, ROUTE_LA, ROUTE_LC, ROUTE_EYE, drawMap, makeMarksTexture, canvasTex, makeMapPass, WorldLayer } from './leftturn-map';
+import { MAP, FACE, EYE_R, routeAt, ROUTE_LA, ROUTE_LC, ROUTE_EYE, mapTextures, makeMapPass, WorldLayer } from './leftturn-map';
 import { GANTT, Schedule } from './leftturn-gantt';
 import { PDoom, formatPDoom } from '../engine/hud';
 
@@ -41,21 +44,42 @@ function mixCam(a: Cam, b: Cam, k: number): Cam {
 /** The gato prompt's caret on its first frame (screen px): the slot lands exactly there. */
 const CARET = { x: 1150, y: 631, w: 5.6, h: 86 };
 
+/**
+ * The run-in, under and through the bureau's last page. The camera is held (tilting up by `drift` px over the
+ * beat before the burst); the spark smoulders north at `creep` (map units/s), its head coming into the frame
+ * (screen y `enter`) on the off-beat before the burst; on the burst it flares up to `speed`, which it keeps to
+ * SRR. The camera picks up the chase as the head reaches screen y `park` (`hold`: how softly, map units), then
+ * eases ahead of it into the roadmap's framing by the turn.
+ */
+const RUN = { creep: 800, speed: 3600, zoom: 0.86, enter: 1100, park: 350, drift: 36, hold: 60 };
+
+/** Soft max(d, 0): 0 well below, d well above, a smooth knee about 0 of width k (never decreasing). */
+function softPos(d: number, k: number) {
+  return d > 0 ? d + k * Math.log1p(Math.exp(-d / k)) : k * Math.log1p(Math.exp(d / k));
+}
+
 export default class LeftTurn extends Scene {
   map!: ReturnType<typeof makeMapPass>;
   ov = new WorldLayer();
   glow = new LineBatch(6000);
   pd!: PDoom;
   sch!: Schedule;
+  /** Rendered inside `bureau`'s transition: that plate draws the spark itself, over its page. */
+  embedded = false;
+  /** The held camera of the run-in (map y, before its drift), and the lead (map units) it picks the spark up at. */
+  holdY = 0;
+  leadPark = 0;
+  beat = 0.4545;
   T = {
     l5: null as unknown as Line, l6: null as unknown as Line,
     sharp: 0, left: 0, turn: 0, and: 0, there: 0, you: 0, youEnd: 0, are: 0, without: 0, cdr: 0,
     tPDR: 0, db1: 0, call: 0, whip0: 0, snare: 0, launch: 0, drain0: 0, cdrSyl: [] as number[],
-    beats: [] as number[],
+    beats: [] as number[], burst: 0,
   };
 
   override init() {
-    this.map = makeMapPass(canvasTex(drawMap(), true), makeMarksTexture(), this.ov);
+    const tx = mapTextures();
+    this.map = makeMapPass(tx.map, tx.marks, this.ov);
     const ly = this.ctx.lyrics, au = this.ctx.audio;
     this.pd = new PDoom(ly);
     const T = this.T;
@@ -77,6 +101,15 @@ export default class LeftTurn extends Scene {
     T.cdr = cdr.start;
     T.cdrSyl = cdr.syl && cdr.syl.length >= 3 ? cdr.syl.map((s) => s[0]) : [0, 1, 2].map((i) => cdr.start + i * 0.4);
     T.tPDR = beatAfter(T.sharp + 0.12);
+    // the spark bursts through the bureau's page on the beat before the cut; the camera is held so that
+    // its head comes into the frame there
+    T.burst = beatBefore(this.ctx.start - 0.05);
+    this.beat = au.timeOfBeat(Math.round(au.beatAt(T.burst)) + 1) - T.burst;
+    // screen y -> camera-relative map units at the run-in zoom (the inverse of the keystone)
+    const K = this.kAt(T.burst), unproject = (y: number) => (y - H / 2) / (1 + K * (y - H / 2)) / RUN.zoom;
+    const tIn = T.burst - this.beat / 2;
+    this.holdY = MAP.Y0 - this.runIn(tIn) - unproject(RUN.enter) + this.driftAt(tIn) / RUN.zoom;
+    this.leadPark = unproject(RUN.park);
     T.db1 = downAfter(T.you);
     T.call = beatAfter(T.are + 0.2);
     T.whip0 = Math.max(beatBefore(T.without), T.without - 0.3) - 0.03;
@@ -97,12 +130,27 @@ export default class LeftTurn extends Scene {
   }
 
   // ---------------------------------------------------------------- the spark on the route
+  /**
+   * Arc length on the run-in (negative: south of YOU ARE HERE): RUN.creep under the page, smoothly up to
+   * RUN.speed across the burst, at SRR on "Sharp". Closed form of the integral of that speed.
+   */
+  runIn(t: number) {
+    const T = this.T, a = T.burst - 0.03, b = T.burst + 0.1, srr = MAP.Y0 - MAP.ms[0]!.y;
+    const ramp = (t: number) => {
+      const u = clamp((t - a) / (b - a));
+      return t >= b ? (b - a) / 2 + (t - b) : (b - a) * (u * u * u - (u * u * u * u) / 2);
+    };
+    const dist = (t: number) => RUN.creep * t + (RUN.speed - RUN.creep) * ramp(t);
+    return srr - (dist(T.sharp) - dist(t));
+  }
+
   sparkS(t: number) {
-    const T = this.T, s0 = this.ctx.start;
+    const T = this.T;
     const srr = MAP.Y0 - MAP.ms[0]!.y, pdr = MAP.Y0 - MAP.ms[1]!.y;
     const tc = T.left + 0.13, sc = ROUTE_LA + ROUTE_LC + 40;
+    if (t < T.sharp) return this.runIn(t);
     if (t < tc) {
-      return keys(t, [[s0 - 0.1, 0], [T.sharp, srr, ease.inQuad], [T.tPDR, pdr, ease.linear], [T.left, ROUTE_LA - 10, ease.linear], [tc, sc, ease.linear]]);
+      return keys(t, [[T.sharp, srr], [T.tPDR, pdr, ease.linear], [T.left, ROUTE_LA - 10, ease.linear], [tc, sc, ease.linear]]);
     }
     // out of the corner at speed, braking into the crater on "there" (cubic Hermite, v1 = 0)
     const D = ROUTE_EYE - sc, dur = T.there - tc, v0 = (ROUTE_LC + 50) / 0.13;
@@ -111,19 +159,26 @@ export default class LeftTurn extends Scene {
   }
 
   // ---------------------------------------------------------------- camera
-  /** Chase, brake, land: the camera rides behind the spark, then settles over the crater. */
+  /** Hold, chase, brake, land: the camera rides behind the spark, then settles over the crater. */
   camLand(t: number): Cam {
     const T = this.T;
     const sp = routeAt(this.sparkS(t));
     const turn = (Math.PI / 2) * prog(t, T.left - 0.02, T.left + 0.24, ease.inOutCubic);
     const hx = -Math.sin(turn), hy = -Math.cos(turn); // forward (screen up) in world coords
-    const lead = keys(t, [[T.turn + 0.25, 230], [T.and, -40, ease.inOutQuad], [T.there, 20, ease.inOutQuad]]);
-    let zoom = keys(t, [[this.ctx.start, 0.78], [T.sharp, 0.86, ease.outCubic], [T.left, 1.0, ease.inOutQuad], [T.left + 0.2, 1.12, ease.outCubic], [T.turn + 0.3, 0.95, ease.inOutQuad], [T.there, 1.02, ease.inOutCubic]]);
+    const lead = keys(t, [[T.burst + 0.25, this.leadPark], [T.left - 0.05, 230, ease.inOutCubic], [T.turn + 0.25, 230], [T.and, -40, ease.inOutQuad], [T.there, 20, ease.inOutQuad]]);
+    let zoom = keys(t, [[T.sharp, RUN.zoom], [T.left, 1.0, ease.inOutQuad], [T.left + 0.2, 1.12, ease.outCubic], [T.turn + 0.3, 0.95, ease.inOutQuad], [T.there, 1.02, ease.inOutCubic]]);
     // the landing punch, then a slow creep in
     zoom *= 1 + 0.32 * ease.outExpo(prog(t, T.there, T.there + 0.3)) + 0.07 * prog(t, T.there + 0.3, T.you, ease.inOutQuad);
     if (t > T.there + 0.2) zoom *= 1 + 0.03 * this.ctx.audio.hit('kick', t, 0.09);
     const rot = turn + 0.09 * prog(t, T.there, T.you + 0.2, ease.inOutQuad);
-    return { x: sp.x + hx * lead, y: sp.y + hy * lead, rot, zoom };
+    let y = sp.y + hy * lead;
+    // the run-in: held over the bureau's page until the spark has come up to its place, then carried along
+    // with it (by the turn the knee is thousands of units behind: exactly the chase)
+    if (t < T.left) {
+      const hold = this.holdY - this.driftAt(t) / RUN.zoom;
+      y = hold - softPos(hold - y, RUN.hold);
+    }
+    return { x: sp.x + hx * lead, y, rot, zoom };
   }
 
   /** The reveal: the whole face, north up. */
@@ -228,10 +283,49 @@ export default class LeftTurn extends Scene {
     return { x: W / 2 + fx / d, y: H / 2 + fy / d };
   }
 
+  /** The spark head on screen. */
+  sparkScreen(t: number) {
+    const p = routeAt(this.sparkS(t));
+    return this.project(p.x, p.y, this.camAt(t), this.kAt(t));
+  }
+
+  /** The held camera's slow tilt north over the beat before the burst (screen px). */
+  driftAt(t: number) {
+    return RUN.drift * ease.inOutQuad(prog(t, this.T.burst - this.beat, this.T.burst));
+  }
+
+  /** How far the sheet has slid down the screen since the run-in's held camera (px, at the run-in zoom). */
+  slide(t: number) {
+    return (this.holdY - this.camAt(t).y) * RUN.zoom;
+  }
+
+  /** The spark(s) riding the route and the schedule, additive over `out`. */
+  renderSpark(out: THREE.WebGLRenderTarget, t: number) {
+    const T = this.T, cam = this.camAt(t);
+    const g = this.glow; g.clear();
+    if (t < T.there + 0.5) {
+      const headAt = (tt: number) => this.sparkScreen(tt);
+      const hp = headAt(t);
+      const I = 1 - prog(t, T.there + 0.05, T.there + 0.45);
+      sparkParticles(g, t, headAt, { rate: 120, speed: 280, intensity: 1.1 * I, seed: 8, width: 2 });
+      sparkHead(g, hp.x, hp.y, t, 1.5 * Math.min(cam.zoom, 1.2), 1.3 * I);
+    }
+    const S = this.sch.T;
+    if (t > T.without - 0.1 && t < S.LAUNCH + 0.5) {
+      const headAt = (tt: number) => this.project(this.sch.playX(tt), GANTT.GL, this.camAt(tt), this.kAt(tt));
+      const hp = headAt(t);
+      const I = prog(t, T.without - 0.1, T.without) * (1 - prog(t, S.LAUNCH + 0.1, S.LAUNCH + 0.45));
+      const stall = t > T.cdr - 0.1 && t < S.zip0;
+      sparkParticles(g, t, headAt, { rate: stall ? 50 : 110, speed: stall ? 160 : 240, intensity: 0.9 * I, seed: 12, width: 1.6 });
+      sparkHead(g, hp.x, hp.y, t, 0.9 * Math.min(Math.sqrt(cam.zoom), 1.5), 1.2 * I);
+    }
+    g.render(this.ctx.renderer, out);
+  }
+
   // ---------------------------------------------------------------- render
   render(f: Frame, out: THREE.WebGLRenderTarget): PostOverrides {
     const { renderer } = this.ctx;
-    const T = this.T, t = f.t, s0 = this.ctx.start, end = this.ctx.end;
+    const T = this.T, t = f.t, end = this.ctx.end;
     const cam = this.camAt(t);
     const K = this.kAt(t);
     const whip = this.whipAt(t);
@@ -246,8 +340,8 @@ export default class LeftTurn extends Scene {
     u.uTaps!.value = clamp(Math.ceil(motion / 3), 1, 16);
     u.uK!.value = K;
     u.uT!.value = t;
-    // the drawing appears from the south as in the original cut; the north (schedule) is unveiled off-screen
-    u.uReveal!.value = t < s0 + 0.5 ? lerp(MAP.Y0 + 300, 600, prog(t, s0 - 0.02, s0 + 0.35, ease.outCubic)) : -2000;
+    // the whole drawing is there from the start: the bureau's page burns open onto it
+    u.uReveal!.value = -2000;
     u.uTrail!.value = this.sparkS(t);
     u.uHeat!.value = 1;
     u.uHaze!.value = keys(t, [[T.you, 0.55], [T.db1, 0.3], [T.without, 0.2], [end - 0.1, 0]]);
@@ -297,27 +391,11 @@ export default class LeftTurn extends Scene {
     (u.uOvCam!.value as THREE.Vector4).set(cam.x, cam.y, cam.rot, cam.zoom);
     this.map.render(renderer, out);
 
-    // ---- the spark
-    const g = this.glow; g.clear();
-    if (t < T.there + 0.5) {
-      const headAt = (tt: number) => { const p = routeAt(this.sparkS(tt)); return this.project(p.x, p.y, this.camAt(tt), this.kAt(tt)); };
-      const hp = headAt(t);
-      const I = 1 - prog(t, T.there + 0.05, T.there + 0.45);
-      sparkParticles(g, t, headAt, { rate: 120, speed: 280, intensity: 1.1 * I, seed: 8, width: 2 });
-      sparkHead(g, hp.x, hp.y, t, 1.5 * Math.min(cam.zoom, 1.2), 1.3 * I);
-    }
-    const S = this.sch.T;
-    if (t > T.without - 0.1 && t < S.LAUNCH + 0.5) {
-      const headAt = (tt: number) => this.project(this.sch.playX(tt), GANTT.GL, this.camAt(tt), this.kAt(tt));
-      const hp = headAt(t);
-      const I = prog(t, T.without - 0.1, T.without) * (1 - prog(t, S.LAUNCH + 0.1, S.LAUNCH + 0.45));
-      const stall = t > T.cdr - 0.1 && t < S.zip0;
-      sparkParticles(g, t, headAt, { rate: stall ? 50 : 110, speed: stall ? 160 : 240, intensity: 0.9 * I, seed: 12, width: 1.6 });
-      sparkHead(g, hp.x, hp.y, t, 0.9 * Math.min(Math.sqrt(cam.zoom), 1.5), 1.2 * I);
-    }
-    g.render(renderer, out);
+    // ---- the spark (inside the bureau's transition that plate draws it, over its page)
+    if (!this.embedded) this.renderSpark(out, t);
 
     // ---- post
+    const S = this.sch.T;
     const corner = pulse(t, T.left, 0.08);
     const land = pulse(t, T.there, 0.07);
     const stampHit = Math.max(pulse(t, S.SRR, 0.06), pulse(t, S.PDR, 0.07), pulse(t, S.LAUNCH, 0.07));
@@ -326,7 +404,6 @@ export default class LeftTurn extends Scene {
     return {
       bloom: lerp(0.75, 0.7, drain) - 0.2 * prog(t, T.there, T.there + 0.2) * (1 - prog(t, T.you, T.db1)), bloomThreshold: lerp(0.85, 0.95, drain), bloomKnee: lerp(0.5, 0.25, drain),
       vignette: lerp(0.45, 0.6, drain), grain: lerp(0.055, 0.065, drain),
-      fade: 1 - prog(t, s0 - 0.02, s0 + 0.12),
       shake: [Math.sin(t * 93) * sh, Math.cos(t * 71) * sh * 0.8],
       ca: 1.2 + 4 * corner + 5 * whip + 2 * land,
       zoom: 1 + 0.03 * corner,

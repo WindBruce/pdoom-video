@@ -13,7 +13,20 @@ ${GLSL_CLIP}
 uniform vec3 camPos, camR, camU, camF; uniform float focal; uniform vec2 res; uniform float time;
 uniform vec3 keyDir; uniform float keyI; uniform vec3 rimDir; uniform float rimI;
 uniform vec3 lampPos; uniform float lampI;
+uniform float fillT; // seconds since the flood started (<0: none)
+uniform vec2 groupHalf; // half extent of the CPU group (world)
+uniform float holdT; // the rows above the group (the lyric's band, seen from above) flood only after this
 vec2 rotv(vec2 v, float a) { float c = cos(a), s = sin(a); return vec2(c * v.x - s * v.y, s * v.x + c * v.y); }
+/** The flood (0..1) of a cell beyond the group: cells pop in as a wave out from the group. */
+float floodK(vec2 cell) {
+  if (fillT < 0.0) return 0.0;
+  vec2 cc = (cell + 0.5) * ${CELLF};
+  float dist = max(abs(cc.x) - groupHalf.x, abs(cc.y) - groupHalf.y);
+  float t0 = dist / 1100.0 + hash12(cell) * 0.1;
+  if (cc.y > groupHalf.y) t0 = max(t0, holdT + dist / 1100.0 + hash12(cell + 31.7) * 0.08);
+  float k = clamp((fillT - t0) / 0.22, 0.0, 1.0);
+  return 1.0 - pow(1.0 - k, 3.0);
+}
 vec3 camRay(out vec2 px) {
   px = vUv * res - 0.5 * res;
   return normalize(camF * focal + camR * px.x + camU * px.y);
@@ -69,16 +82,10 @@ ${GLSL_SHADE}
 uniform vec4 items[${MAX_ITEMS}];
 uniform int nItems;
 uniform float sT0, sH0, rad0, hot0, rad;
-uniform float fillT; // seconds since the flood started (<0: none)
-uniform vec2 groupHalf; // half extent of the CPU group (world)
 float fillK(vec2 cell) {
   vec2 cc = (cell + 0.5) * ${CELLF};
   if (abs(cc.x) < groupHalf.x && abs(cc.y) < groupHalf.y) return -1.0; // inside the group
-  if (fillT < 0.0) return 0.0;
-  float dist = max(abs(cc.x) - groupHalf.x, abs(cc.y) - groupHalf.y);
-  float t0 = dist / 1100.0 + hash12(cell) * 0.1;
-  float k = clamp((fillT - t0) / 0.22, 0.0, 1.0);
-  return 1.0 - pow(1.0 - k, 3.0);
+  return floodK(cell);
 }
 vec3 topSample(vec2 px) {
   vec3 rd = normalize(camF * focal + camR * px.x + camU * px.y);
@@ -141,16 +148,11 @@ void main() {
 // Phases B–D: raymarched infinite lattice (floor stack + optional ceiling stack), fog, lamp.
 export const FRAG_MARCH = /* glsl */ `
 ${GLSL_SHADE}
-uniform float rad, pz, ceilZ, lowerOn, fogK, fogFar, fillT, slitK, slitH, horizonY;
-uniform vec2 groupHalf;
+uniform float rad, pz, ceilZ, lowerOn, fogK, fogFar, slitK, slitH, horizonY;
 float fillK(vec2 cell) {
   vec2 cc = (cell + 0.5) * ${CELLF};
   if (abs(cc.x) < groupHalf.x && abs(cc.y) < groupHalf.y) return 1.0;
-  if (fillT < 0.0) return 0.0;
-  float dist = max(abs(cc.x) - groupHalf.x, abs(cc.y) - groupHalf.y);
-  float t0 = dist / 1100.0 + hash12(cell) * 0.1;
-  float k = clamp((fillT - t0) / 0.22, 0.0, 1.0);
-  return 1.0 - pow(1.0 - k, 3.0);
+  return floodK(cell);
 }
 // one layer of basket-woven cells; q relative to the layer plane; k = layer index (seeds everything)
 // info = (lateral, height, -, k)
